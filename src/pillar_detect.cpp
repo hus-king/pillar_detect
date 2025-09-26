@@ -15,9 +15,32 @@
 #include <locale.h>
 #include <deque>
 #include <mutex>
+#include <map>
 
 typedef pcl::PointXYZ PointT;
 typedef pcl::PointCloud<PointT> PointCloudT;
+
+// 全局柱子结构体
+struct GlobalPillar {
+    Eigen::Vector2f xy;         // XY平面位置
+    float radius;               // 半径
+    float z_min, z_max;         // Z方向范围
+    ros::Time last_seen;        // 最后一次观测时间
+    int observation_count;      // 被观测到的次数（用于置信度）
+    bool confirmed = false;     // 是否已确认为真实東子
+    
+    GlobalPillar() : xy(0, 0), radius(0), z_min(0), z_max(0), observation_count(0) {}
+};
+
+// 柱子候选结构体
+struct PillarCandidate {
+    float x, y;                 // XY中心位置
+    float radius;               // 半径
+    float z_min, z_max;         // Z范围
+    int point_count;            // 点数
+    
+    PillarCandidate() : x(0), y(0), radius(0), z_min(0), z_max(0), point_count(0) {}
+};
 
 class PillarDetector {
 public:
@@ -44,7 +67,7 @@ public:
         
         // 柱子检测参数
         nh_.param<double>("min_pillar_height", min_pillar_height_, 0.5);
-        nh_.param<double>("max_pillar_radius", max_pillar_radius_, 0.5);
+        nh_.param<double>("max_pillar_radius", max_pillar_radius_, 0.08);
         
         // 柱子保留和自适应采样参数
         nh_.param<bool>("enable_pillar_preservation", enable_pillar_preservation_, true);
@@ -60,6 +83,16 @@ public:
         // 统计输出参数
         nh_.param<bool>("enable_point_count_output", enable_point_count_output_, true);
         nh_.param<int>("detailed_stats_interval", detailed_stats_interval_, 10);
+        nh_.param<bool>("enable_detailed_pillar_info", enable_detailed_pillar_info_, true);
+        
+        // 混合检测模式参数
+        nh_.param<bool>("enable_hybrid_detection", enable_hybrid_detection_, true);
+        nh_.param<int>("min_observation_to_confirm", min_observation_to_confirm_, 2);
+        nh_.param<float>("pillar_merge_distance", pillar_merge_distance_, 0.3);
+        nh_.param<bool>("enable_exploration", enable_exploration_, true);
+        nh_.param<float>("known_region_expansion", known_region_expansion_, 0.5);
+        nh_.param<float>("pillar_z_search_margin", pillar_z_search_margin_, 1.0);
+        nh_.param<float>("new_pillar_height_factor", new_pillar_height_factor_, 0.9);
         
         // 话题配置
         std::string input_topic, pillar_topic, accumulated_topic;
@@ -73,6 +106,11 @@ public:
         pub_pillar_ = nh_.advertise<sensor_msgs::PointCloud2>(pillar_topic, 1);
         // 发布积累的点云
         pub_accumulated_ = nh_.advertise<sensor_msgs::PointCloud2>(accumulated_topic, 1);
+        
+        // 初始化全局柱子地图相关
+        pillar_centroids_cloud_.reset(new PointCloudT);
+        pillar_kdtree_.setInputCloud(pillar_centroids_cloud_);
+        next_pillar_id_ = 1;
 
         ROS_INFO("柱子检测器已初始化");
         ROS_INFO("订阅话题: %s", input_topic.c_str());
@@ -89,9 +127,17 @@ public:
                 enable_connect_broken_pillars_ ? "是" : "否",
                 pillar_connection_xy_threshold_,
                 pillar_connection_max_z_gap_);
-        ROS_INFO("统计输出设置: 启用=%s, 详细统计间隔=%d次", 
+        ROS_INFO("统计输出设置: 启用=%s, 详细统计间隔=%d次, 详细柱子信息=%s", 
                 enable_point_count_output_ ? "是" : "否",
-                detailed_stats_interval_);
+                detailed_stats_interval_,
+                enable_detailed_pillar_info_ ? "是" : "否");
+        ROS_INFO("混合检测模式: 启用=%s, 探索新柱子=%s, 确认观测次数=%d", 
+                enable_hybrid_detection_ ? "是" : "否",
+                enable_exploration_ ? "是" : "否",
+                min_observation_to_confirm_);
+        ROS_INFO("高度动态更新: Z搜索边界=%.2fm, 新柱子高度因子=%.2f", 
+                pillar_z_search_margin_,
+                new_pillar_height_factor_);
     }
 
 private:
@@ -147,68 +193,14 @@ private:
             ROS_DEBUG("高度滤波后剩余 %zu 个点", cloud_height->size());
         }
 
-        // 3. 欧氏聚类（基于距离的聚类）
-        std::vector<pcl::PointIndices> cluster_indices;
-        pcl::search::KdTree<PointT>::Ptr tree(new pcl::search::KdTree<PointT>);
-        tree->setInputCloud(processing_cloud);
-
-        pcl::EuclideanClusterExtraction<PointT> ec;
-        ec.setClusterTolerance(cluster_tolerance_); // 使用参数配置的聚类距离
-        ec.setMinClusterSize(min_cluster_size_);   // 使用参数配置的最小聚类点数
-        ec.setMaxClusterSize(max_cluster_size_);   // 使用参数配置的最大聚类点数
-        ec.setSearchMethod(tree);
-        ec.setInputCloud(processing_cloud);
-        ec.extract(cluster_indices);
-
-        ROS_INFO("检测到 %zu 个聚类簇", cluster_indices.size());
-
-        // 4. 筛选"杆子"候选簇
-        PointCloudT::Ptr pillar_cloud(new PointCloudT);
-        int pillar_count = 0;
-        for (const auto& indices : cluster_indices) {
-            PointCloudT::Ptr cluster(new PointCloudT);
-            pcl::copyPointCloud(*processing_cloud, indices, *cluster);
-            
-            // 计算包围盒或主方向
-            Eigen::Vector4f centroid;
-            pcl::compute3DCentroid(*cluster, centroid);
-            
-            // 计算Z方向的范围
-            float min_z = std::numeric_limits<float>::max();
-            float max_z = -std::numeric_limits<float>::max();
-            for (const auto& pt : cluster->points) {
-                if (pt.z < min_z) min_z = pt.z;
-                if (pt.z > max_z) max_z = pt.z;
-            }
-            float height = max_z - min_z;
-            
-            // 计算XY平面投影的半径（近似）
-            float max_radius = 0.0f;
-            for (const auto& pt : cluster->points) {
-                float dx = pt.x - centroid[0];
-                float dy = pt.y - centroid[1];
-                float r = std::sqrt(dx*dx + dy*dy);
-                if (r > max_radius) max_radius = r;
-            }
-            
-            // 启发式判断：高而细（使用配置的参数）
-            if (height > min_pillar_height_ && max_radius < max_pillar_radius_) {
-                // 可选：检查是否"孤立"——周围一定范围内无其他大簇
-                // 此处简化：仅用几何特征
-                pillar_count++;
-                ROS_INFO("检测到柱子 %d: 高度=%.2fm, 半径=%.2fm, 包含%zu个点", 
-                         pillar_count, height, max_radius, cluster->size());
-                *pillar_cloud += *cluster;
-            }
+        // 使用混合检测模式
+        if (enable_hybrid_detection_) {
+            // 混合检测流程
+            hybridPillarDetection(processing_cloud, msg->header);
+        } else {
+            // 传统全图检测模式
+            traditionalPillarDetection(processing_cloud, msg->header);
         }
-
-        // 5. 发布结果
-        ROS_INFO("本次检测完成，共找到 %d 个柱子，发布 %zu 个点", pillar_count, pillar_cloud->size());
-        
-        sensor_msgs::PointCloud2 output_msg;
-        pcl::toROSMsg(*pillar_cloud, output_msg);
-        output_msg.header = msg->header; // 保持时间戳和坐标系
-        pub_pillar_.publish(output_msg);
         
         // 计算并记录处理时间，监控性能
         ros::WallTime end_time = ros::WallTime::now();
@@ -224,6 +216,144 @@ private:
         } catch (...) {
             ROS_ERROR("点云处理过程中发生未知异常");
         }
+    }
+    
+    // 混合检测模式：结合全局柱子地图和新区域探索
+    void hybridPillarDetection(const PointCloudT::Ptr& cloud, const std_msgs::Header& header) {
+        ros::WallTime start_time = ros::WallTime::now();
+        
+        // 1. 构建当前帧的"未知区域"点云
+        PointCloudT::Ptr unknown_region_cloud = extractUnknownRegion(cloud);
+        
+        // 2. 对未知区域运行轻量级新柱子检测
+        std::vector<PillarCandidate> new_candidates;
+        if (enable_exploration_ && !unknown_region_cloud->empty()) {
+            new_candidates = detectNewPillars(unknown_region_cloud);
+            ROS_DEBUG("在未知区域检测到 %zu 个新柱子候选", new_candidates.size());
+        }
+        
+        // 3. 将新候选加入全局地图（去重、融合）
+        if (!new_candidates.empty()) {
+            updateGlobalPillarMap(new_candidates, header.stamp);
+        }
+        
+        // 4. 对所有已确认的柱子做快速验证和提取
+        PointCloudT::Ptr final_pillar_cloud = validateAndExtractPillars(cloud);
+        
+        // 5. 发布结果
+        publishPillarResult(final_pillar_cloud, header);
+        
+        // 性能统计
+        double execution_time = (ros::WallTime::now() - start_time).toSec() * 1000;
+        ROS_INFO("混合检测完成: 全局柱子%zu个, 已确认%zu个, 本次检测%zu个点, 耗时%.2fms", 
+                 global_pillar_map_.size(), getConfirmedPillarCount(), 
+                 final_pillar_cloud->size(), execution_time);
+    }
+    
+    // 传统全图检测模式（保持原有逻辑）
+    void traditionalPillarDetection(const PointCloudT::Ptr& cloud, const std_msgs::Header& header) {
+        // 3. 欧氏聚类（基于距离的聚类）
+        std::vector<pcl::PointIndices> cluster_indices;
+        pcl::search::KdTree<PointT>::Ptr tree(new pcl::search::KdTree<PointT>);
+        tree->setInputCloud(cloud);
+
+        pcl::EuclideanClusterExtraction<PointT> ec;
+        ec.setClusterTolerance(cluster_tolerance_); // 使用参数配置的聚类距离
+        ec.setMinClusterSize(min_cluster_size_);   // 使用参数配置的最小聚类点数
+        ec.setMaxClusterSize(max_cluster_size_);   // 使用参数配置的最大聚类点数
+        ec.setSearchMethod(tree);
+        ec.setInputCloud(cloud);
+        ec.extract(cluster_indices);
+
+        ROS_INFO("检测到 %zu 个聚类簇", cluster_indices.size());
+
+        // 4. 筛选"杆子"候选簇
+        PointCloudT::Ptr pillar_cloud(new PointCloudT);
+        int pillar_count = 0;
+        for (const auto& indices : cluster_indices) {
+            PointCloudT::Ptr cluster(new PointCloudT);
+            pcl::copyPointCloud(*cloud, indices, *cluster);
+            
+            // 计算包围盒或主方向
+            Eigen::Vector4f centroid;
+            pcl::compute3DCentroid(*cluster, centroid);
+            
+            // 计算Z方向的范围和最高点
+            float min_z = std::numeric_limits<float>::max();
+            float max_z = -std::numeric_limits<float>::max();
+            for (const auto& pt : cluster->points) {
+                if (pt.z < min_z) min_z = pt.z;
+                if (pt.z > max_z) max_z = pt.z;
+            }
+            float height = max_z - min_z;
+            
+            // 计算XY平面投影的几何特征
+            float max_radius = 0.0f;
+            float min_x = std::numeric_limits<float>::max();
+            float max_x = -std::numeric_limits<float>::max();
+            float min_y = std::numeric_limits<float>::max();
+            float max_y = -std::numeric_limits<float>::max();
+            
+            for (const auto& pt : cluster->points) {
+                // 计算半径
+                float dx = pt.x - centroid[0];
+                float dy = pt.y - centroid[1];
+                float r = std::sqrt(dx*dx + dy*dy);
+                if (r > max_radius) max_radius = r;
+                
+                // 计算XY包围盒用于宽度计算
+                if (pt.x < min_x) min_x = pt.x;
+                if (pt.x > max_x) max_x = pt.x;
+                if (pt.y < min_y) min_y = pt.y;
+                if (pt.y > max_y) max_y = pt.y;
+            }
+            
+            // 计算宽度（包围盒的对角线长度）
+            float width_x = max_x - min_x;
+            float width_y = max_y - min_y;
+            float bbox_width = std::sqrt(width_x*width_x + width_y*width_y);
+            float diameter = max_radius * 2.0f; // 直径
+            
+            // 启发式判断：高而细（使用配置的参数）
+            if (height > min_pillar_height_ && max_radius < max_pillar_radius_) {
+                // 可选：检查是否"孤立"——周围一定范围内无其他大簇
+                // 此处简化：仅用几何特征
+                pillar_count++;
+                
+                // 输出详细的柱子信息（如果启用）
+                if (enable_detailed_pillar_info_) {
+                    ROS_INFO("=== 检测到柱子 #%d ===", pillar_count);
+                    ROS_INFO("  位置中心: (%.2f, %.2f, %.2f)", centroid[0], centroid[1], centroid[2]);
+                    ROS_INFO("  高度: %.3fm (从 %.3fm 到 %.3fm)", height, min_z, max_z);
+                    ROS_INFO("  最高点高度: %.3fm", max_z);
+                    ROS_INFO("  宽度信息:");
+                    ROS_INFO("    - 最大半径: %.3fm", max_radius);
+                    ROS_INFO("    - 直径: %.3fm", diameter);
+                    ROS_INFO("    - 包围盒宽度: %.3fm (X:%.3f, Y:%.3f)", bbox_width, width_x, width_y);
+                    ROS_INFO("  点数量: %zu 个点", cluster->size());
+                    ROS_INFO("  点密度: %.1f 点/m³", (float)cluster->size() / (M_PI * max_radius * max_radius * height));
+                    ROS_INFO("  高宽比: %.2f", height / (diameter > 0 ? diameter : 0.001));
+                    ROS_INFO("========================");
+                } else {
+                    ROS_INFO("检测到柱子 %d: 高度=%.3fm, 最大半径=%.3fm, 最高点=%.3fm, 点数=%zu", 
+                             pillar_count, height, max_radius, max_z, cluster->size());
+                }
+                
+                *pillar_cloud += *cluster;
+            }
+        }
+
+        // 5. 发布结果
+        publishPillarResult(pillar_cloud, header);
+        ROS_INFO("传统检测完成，共找到 %d 个柱子，发布 %zu 个点", pillar_count, pillar_cloud->size());
+    }
+    
+    // 发布柱子检测结果
+    void publishPillarResult(const PointCloudT::Ptr& pillar_cloud, const std_msgs::Header& header) {
+        sensor_msgs::PointCloud2 output_msg;
+        pcl::toROSMsg(*pillar_cloud, output_msg);
+        output_msg.header = header; // 保持时间戳和坐标系
+        pub_pillar_.publish(output_msg);
     }
 
     // 将当前点云添加到积累队列中
@@ -607,6 +737,377 @@ private:
         }
     }
     
+    // 提取"未知区域"点云：排除已知柱子附近的点
+    PointCloudT::Ptr extractUnknownRegion(const PointCloudT::Ptr& cloud) {
+        PointCloudT::Ptr unknown(new PointCloudT);
+        
+        // 如果还没有已确认的柱子，整帧都是未知区域
+        if (getConfirmedPillarCount() == 0) {
+            *unknown = *cloud;
+            return unknown;
+        }
+
+        // 使用KDTree快速查询每个点是否靠近已知柱子
+        for (const auto& pt : cloud->points) {
+            std::vector<int> indices;
+            std::vector<float> sqr_distances;
+            
+            pcl::PointXYZ search_pt(pt.x, pt.y, 0); // 只关心XY平面
+            float search_radius = max_pillar_radius_ + known_region_expansion_;
+            
+            if (pillar_kdtree_.radiusSearch(search_pt, search_radius, indices, sqr_distances) > 0) {
+                // 该点在某个已知柱子附近 → 跳过（属于已知区域）
+                continue;
+            }
+            unknown->points.push_back(pt);
+        }
+        
+        unknown->width = unknown->points.size();
+        unknown->height = 1;
+        unknown->is_dense = false;
+        
+        ROS_DEBUG("未知区域点数: %zu / %zu (%.1f%%)", 
+                  unknown->size(), cloud->size(), 
+                  cloud->empty() ? 0.0 : (double)unknown->size() / cloud->size() * 100.0);
+        
+        return unknown;
+    }
+    
+    // 轻量级新柱子检测：仅对未知区域进行检测
+    std::vector<PillarCandidate> detectNewPillars(const PointCloudT::Ptr& cloud) {
+        std::vector<PillarCandidate> candidates;
+        if (cloud->empty()) return candidates;
+
+        // 轻量聚类（稍微放宽参数，避免过度碎片化）
+        std::vector<pcl::PointIndices> cluster_indices;
+        pcl::search::KdTree<PointT>::Ptr tree(new pcl::search::KdTree<PointT>);
+        tree->setInputCloud(cloud);
+
+        pcl::EuclideanClusterExtraction<PointT> ec;
+        ec.setClusterTolerance(cluster_tolerance_ * 1.2);  // 稍大一点，避免碎片
+        ec.setMinClusterSize(min_cluster_size_ / 2);       // 更小簇也接受
+        ec.setMaxClusterSize(max_cluster_size_);
+        ec.setSearchMethod(tree);
+        ec.setInputCloud(cloud);
+        ec.extract(cluster_indices);
+
+        int candidate_count = 0;
+        for (const auto& indices : cluster_indices) {
+            PointCloudT::Ptr cluster(new PointCloudT);
+            pcl::copyPointCloud(*cloud, indices, *cluster);
+            
+            // 计算几何特征
+            Eigen::Vector4f centroid;
+            pcl::compute3DCentroid(*cluster, centroid);
+            
+            // 计算Z方向范围和XY几何信息
+            float min_z = std::numeric_limits<float>::max();
+            float max_z = -std::numeric_limits<float>::max();
+            float max_radius = 0.0f;
+            float min_x = std::numeric_limits<float>::max();
+            float max_x = -std::numeric_limits<float>::max();
+            float min_y = std::numeric_limits<float>::max();
+            float max_y = -std::numeric_limits<float>::max();
+            
+            for (const auto& pt : cluster->points) {
+                if (pt.z < min_z) min_z = pt.z;
+                if (pt.z > max_z) max_z = pt.z;
+                
+                float dx = pt.x - centroid[0];
+                float dy = pt.y - centroid[1];
+                float r = std::sqrt(dx*dx + dy*dy);
+                if (r > max_radius) max_radius = r;
+                
+                // XY包围盒
+                if (pt.x < min_x) min_x = pt.x;
+                if (pt.x > max_x) max_x = pt.x;
+                if (pt.y < min_y) min_y = pt.y;
+                if (pt.y > max_y) max_y = pt.y;
+            }
+            
+            float height = max_z - min_z;
+            float width_x = max_x - min_x;
+            float width_y = max_y - min_y;
+            float bbox_width = std::sqrt(width_x*width_x + width_y*width_y);
+            float diameter = max_radius * 2.0f;
+            
+            // 判断是否像柱子：使用更严格的高度标准，减少噪声
+            if (height > min_pillar_height_ * new_pillar_height_factor_ && max_radius < max_pillar_radius_ * 1.2) {
+                PillarCandidate candidate;
+                candidate.x = centroid[0];
+                candidate.y = centroid[1];
+                candidate.radius = max_radius;
+                candidate.z_min = min_z;
+                candidate.z_max = max_z;
+                candidate.point_count = cluster->size();
+                candidates.push_back(candidate);
+                
+                candidate_count++;
+                
+                // 输出详细的新柱子候选信息（如果启用）
+                if (enable_detailed_pillar_info_) {
+                    ROS_INFO("=== 新柱子候选 #%d ===", candidate_count);
+                    ROS_INFO("  位置中心: (%.2f, %.2f, %.2f)", centroid[0], centroid[1], centroid[2]);
+                    ROS_INFO("  高度: %.3fm (从 %.3fm 到 %.3fm)", height, min_z, max_z);
+                    ROS_INFO("  最高点高度: %.3fm", max_z);
+                    ROS_INFO("  宽度信息:");
+                    ROS_INFO("    - 最大半径: %.3fm", max_radius);
+                    ROS_INFO("    - 直径: %.3fm", diameter);
+                    ROS_INFO("    - 包围盒宽度: %.3fm (X:%.3f, Y:%.3f)", bbox_width, width_x, width_y);
+                    ROS_INFO("  点数量: %zu 个点", cluster->size());
+                    ROS_INFO("  点密度: %.1f 点/m³", (float)cluster->size() / (M_PI * max_radius * max_radius * height));
+                    ROS_INFO("  高宽比: %.2f", height / (diameter > 0 ? diameter : 0.001));
+                    ROS_INFO("  [状态: 新发现，等待确认]");
+                    ROS_INFO("========================");
+                } else {
+                    ROS_INFO("新柱子候选 #%d: 高度=%.3fm, 最大半径=%.3fm, 最高点=%.3fm, 点数=%zu [待确认]", 
+                             candidate_count, height, max_radius, max_z, cluster->size());
+                }
+            }
+        }
+        
+        if (candidates.empty()) {
+            ROS_DEBUG("在未知区域中未发现新的柱子候选");
+        } else {
+            ROS_INFO("在未知区域中发现 %zu 个新柱子候选", candidates.size());
+        }
+        
+        return candidates;
+    }
+    
+    // 更新全局柱子地图：融合新候选，去重，确认
+    void updateGlobalPillarMap(const std::vector<PillarCandidate>& new_candidates, const ros::Time& now) {
+        std::lock_guard<std::mutex> lock(pillar_map_mutex_);
+        
+        for (const auto& cand : new_candidates) {
+            bool merged = false;
+            
+            // 检查是否与已有柱子重合
+            for (auto& [id, pillar] : global_pillar_map_) {
+                float dist = (pillar.xy - Eigen::Vector2f(cand.x, cand.y)).norm();
+                if (dist < pillar_merge_distance_) {
+                    // 同一根柱子：融合数据
+                    float weight = (float)pillar.observation_count / (pillar.observation_count + 1);
+                    pillar.xy = pillar.xy * weight + Eigen::Vector2f(cand.x, cand.y) * (1.0f - weight);
+                    pillar.radius = std::min(std::max(pillar.radius, cand.radius), (float)max_pillar_radius_);
+                    pillar.z_min = std::min(pillar.z_min, cand.z_min);
+                    pillar.z_max = std::max(pillar.z_max, cand.z_max);
+                    pillar.last_seen = now;
+                    pillar.observation_count++;
+                    
+                    // 判断是否可以确认为真实柱子
+                    if (pillar.observation_count >= min_observation_to_confirm_) {
+                        pillar.confirmed = true;
+                    }
+                    
+                    merged = true;
+                    ROS_DEBUG("合并柱子候选到ID %d, 观测次数: %d", id, pillar.observation_count);
+                    break;
+                }
+            }
+            
+            if (!merged) {
+                // 新柱子：添加到地图
+                GlobalPillar new_pillar;
+                new_pillar.xy = Eigen::Vector2f(cand.x, cand.y);
+                new_pillar.radius = std::min(cand.radius, (float)max_pillar_radius_);
+                new_pillar.z_min = cand.z_min;
+                new_pillar.z_max = cand.z_max;
+                new_pillar.last_seen = now;
+                new_pillar.observation_count = 1;
+                new_pillar.confirmed = false; // 需要多次观测确认
+
+                int new_id = next_pillar_id_++;
+                global_pillar_map_[new_id] = new_pillar;
+                
+                ROS_INFO("发现新柱子候选 ID %d: (%.2f, %.2f), 高度=%.2fm, 半径=%.2fm", 
+                         new_id, cand.x, cand.y, cand.z_max - cand.z_min, cand.radius);
+            }
+        }
+
+        // 更新KDTree用于下一次查询
+        updatePillarKdTree();
+    }
+    
+    // 验证和提取所有已确认柱子的点云
+    PointCloudT::Ptr validateAndExtractPillars(const PointCloudT::Ptr& cloud) {
+        PointCloudT::Ptr result(new PointCloudT);
+        std::lock_guard<std::mutex> lock(pillar_map_mutex_);
+        
+        int validated_pillar_count = 0;
+        
+        // 遍历所有已确认的柱子
+        for (const auto& [id, pillar] : global_pillar_map_) {
+            if (!pillar.confirmed) continue;
+            
+            // 提取该柱子附近的点 - 使用扩展的Z搜索范围
+            PointCloudT::Ptr pillar_points(new PointCloudT);
+            for (const auto& pt : cloud->points) {
+                float dx = pt.x - pillar.xy[0];
+                float dy = pt.y - pillar.xy[1];
+                float xy_dist = std::sqrt(dx*dx + dy*dy);
+                
+                // 检查是否在柱子的XY范围内和扩展的Z范围内
+                if (xy_dist <= pillar.radius * 1.5 && 
+                    pt.z >= pillar.z_min - pillar_z_search_margin_ && 
+                    pt.z <= pillar.z_max + pillar_z_search_margin_) {
+                    pillar_points->points.push_back(pt);
+                }
+            }
+            
+            if (!pillar_points->empty()) {
+                pillar_points->width = pillar_points->points.size();
+                pillar_points->height = 1;
+                pillar_points->is_dense = false;
+                
+                // 计算当前帧中该柱子的详细统计信息
+                Eigen::Vector4f centroid;
+                pcl::compute3DCentroid(*pillar_points, centroid);
+                
+                float min_z = std::numeric_limits<float>::max();
+                float max_z = -std::numeric_limits<float>::max();
+                float max_radius_current = 0.0f;
+                float min_x = std::numeric_limits<float>::max();
+                float max_x = -std::numeric_limits<float>::max();
+                float min_y = std::numeric_limits<float>::max();
+                float max_y = -std::numeric_limits<float>::max();
+                
+                for (const auto& pt : pillar_points->points) {
+                    // Z范围
+                    if (pt.z < min_z) min_z = pt.z;
+                    if (pt.z > max_z) max_z = pt.z;
+                    
+                    // 当前帧中的半径
+                    float dx = pt.x - centroid[0];
+                    float dy = pt.y - centroid[1];
+                    float r = std::sqrt(dx*dx + dy*dy);
+                    if (r > max_radius_current) max_radius_current = r;
+                    
+                    // XY包围盒
+                    if (pt.x < min_x) min_x = pt.x;
+                    if (pt.x > max_x) max_x = pt.x;
+                    if (pt.y < min_y) min_y = pt.y;
+                    if (pt.y > max_y) max_y = pt.y;
+                }
+                
+                float height = max_z - min_z;
+                float width_x = max_x - min_x;
+                float width_y = max_y - min_y;
+                float bbox_width = std::sqrt(width_x*width_x + width_y*width_y);
+                float diameter = max_radius_current * 2.0f;
+                
+                // ✅ 关键：动态更新全局柱子的高度范围和其他属性
+                auto& mutable_pillar = const_cast<GlobalPillar&>(pillar);
+                bool height_updated = false;
+                bool radius_updated = false;
+                
+                // 更新Z范围
+                if (min_z < mutable_pillar.z_min) {
+                    mutable_pillar.z_min = min_z;
+                    height_updated = true;
+                }
+                if (max_z > mutable_pillar.z_max) {
+                    mutable_pillar.z_max = max_z;
+                    height_updated = true;
+                }
+                
+                // 更新半径（如果当前观测到更大的半径，但不超过最大半径限制）
+                if (max_radius_current > mutable_pillar.radius) {
+                    mutable_pillar.radius = std::min(max_radius_current, (float)max_pillar_radius_);
+                    radius_updated = true;
+                }
+                
+                // 更新位置（加权平均，给更多观测更高权重）
+                float weight = 1.0f / (mutable_pillar.observation_count + 1.0f);
+                mutable_pillar.xy = mutable_pillar.xy * (1.0f - weight) + 
+                                   Eigen::Vector2f(centroid[0], centroid[1]) * weight;
+                
+                // 更新观测统计
+                mutable_pillar.last_seen = ros::Time::now();
+                mutable_pillar.observation_count++;
+                
+                validated_pillar_count++;
+                
+                // 输出详细的柱子验证信息（如果启用）
+                if (enable_detailed_pillar_info_) {
+                    ROS_INFO("=== 已知柱子 #%d (ID: %d) 验证 %s ===", 
+                             validated_pillar_count, id,
+                             (height_updated || radius_updated) ? "[已更新]" : "");
+                    ROS_INFO("  历史信息:");
+                    ROS_INFO("    - 全局位置: (%.2f, %.2f)", mutable_pillar.xy[0], mutable_pillar.xy[1]);
+                    ROS_INFO("    - 历史观测次数: %d", mutable_pillar.observation_count);
+                    ROS_INFO("    - 全局半径: %.3fm %s", mutable_pillar.radius, radius_updated ? "[已更新]" : "");
+                    ROS_INFO("    - 全局Z范围: %.3f ~ %.3fm %s", mutable_pillar.z_min, mutable_pillar.z_max, height_updated ? "[已扩展]" : "");
+                    ROS_INFO("  当前帧信息:");
+                    ROS_INFO("    - 当前位置: (%.2f, %.2f, %.2f)", centroid[0], centroid[1], centroid[2]);
+                    ROS_INFO("    - 当前高度: %.3fm (从 %.3fm 到 %.3fm)", height, min_z, max_z);
+                    ROS_INFO("    - 最高点高度: %.3fm", max_z);
+                    ROS_INFO("    - 当前宽度信息:");
+                    ROS_INFO("      * 最大半径: %.3fm", max_radius_current);
+                    ROS_INFO("      * 直径: %.3fm", diameter);
+                    ROS_INFO("      * 包围盒宽度: %.3fm (X:%.3f, Y:%.3f)", bbox_width, width_x, width_y);
+                    ROS_INFO("    - 当前点数量: %zu 个点", pillar_points->size());
+                    if (height > 0 && diameter > 0) {
+                        ROS_INFO("    - 当前点密度: %.1f 点/m³", (float)pillar_points->size() / (M_PI * max_radius_current * max_radius_current * height));
+                        ROS_INFO("    - 当前高宽比: %.2f", height / diameter);
+                    }
+                    
+                    // 显示更新状态
+                    if (height_updated) {
+                        ROS_INFO("    🔺 柱子高度范围已扩展！全局高度现在为 %.3fm", mutable_pillar.z_max - mutable_pillar.z_min);
+                    }
+                    if (radius_updated) {
+                        ROS_INFO("    📏 柱子半径已更新为 %.3fm", mutable_pillar.radius);
+                    }
+                    ROS_INFO("================================");
+                } else {
+                    ROS_INFO("已知柱子 #%d (ID: %d): 高度=%.3fm, 最大半径=%.3fm, 最高点=%.3fm, 点数=%zu, 观测%d次", 
+                             validated_pillar_count, id, height, max_radius_current, max_z, pillar_points->size(), pillar.observation_count);
+                }
+                
+                *result += *pillar_points;
+            } else {
+                ROS_WARN("柱子 ID %d 在当前帧中未找到点云数据", id);
+            }
+        }
+        
+        ROS_INFO("混合检测模式：验证了 %d 个已知柱子", validated_pillar_count);
+        return result;
+    }
+        
+    // 更新柱子质心的KDTree，用于快速区域查询
+    void updatePillarKdTree() {
+        pillar_centroids_cloud_->clear();
+        
+        for (const auto& [id, pillar] : global_pillar_map_) {
+            if (!pillar.confirmed) continue;  // 只包含已确认的柱子
+            
+            pcl::PointXYZ pt;
+            pt.x = pillar.xy[0];
+            pt.y = pillar.xy[1];
+            pt.z = 0;  // KDTree查询时只关心XY平面
+            pillar_centroids_cloud_->points.push_back(pt);
+        }
+        
+        pillar_centroids_cloud_->width = pillar_centroids_cloud_->points.size();
+        pillar_centroids_cloud_->height = 1;
+        pillar_centroids_cloud_->is_dense = true;
+        
+        if (!pillar_centroids_cloud_->empty()) {
+            pillar_kdtree_.setInputCloud(pillar_centroids_cloud_);
+        }
+    }
+    
+    // 获取已确认柱子的数量
+    size_t getConfirmedPillarCount() const {
+        std::lock_guard<std::mutex> lock(pillar_map_mutex_);
+        size_t count = 0;
+        for (const auto& [id, pillar] : global_pillar_map_) {
+            if (pillar.confirmed) count++;
+        }
+        return count;
+    }
+    
     // 连接因雷达扫描缺失而断开的柱子
     void connectBrokenPillars(const std::vector<PointCloudT::Ptr>& potential_pillars, 
                               const std::vector<Eigen::Vector4f>& pillar_centroids,
@@ -771,6 +1272,23 @@ private:
     // 统计输出相关参数
     bool enable_point_count_output_ = true;    // 是否启用点数统计输出
     int detailed_stats_interval_ = 10;         // 详细统计信息输出间隔
+    bool enable_detailed_pillar_info_ = true;  // 是否启用详细柱子信息输出
+    
+    // 混合检测模式相关参数
+    bool enable_hybrid_detection_ = true;      // 是否启用混合检测模式
+    int min_observation_to_confirm_ = 2;       // 确认为真实柱子需要的最小观测次数
+    float pillar_merge_distance_ = 0.3;        // 柱子合并距离阈值
+    bool enable_exploration_ = true;           // 是否启用新区域探索
+    float known_region_expansion_ = 0.5;       // 已知区域扩展半径
+    float pillar_z_search_margin_ = 1.0;       // 柱子Z方向搜索边界扩展
+    float new_pillar_height_factor_ = 0.9;     // 新柱子高度因子
+    
+    // 全局柱子地图相关
+    std::map<int, GlobalPillar> global_pillar_map_;  // 全局柱子地图
+    pcl::KdTreeFLANN<pcl::PointXYZ> pillar_kdtree_; // 柱子位置KDTree
+    PointCloudT::Ptr pillar_centroids_cloud_;        // 柱子质心点云（用于KDTree）
+    int next_pillar_id_ = 1;                         // 下一个柱子ID
+    mutable std::mutex pillar_map_mutex_;            // 全局地图互斥锁
     
     // 点云预处理参数
     double voxel_size_;
