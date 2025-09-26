@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- 加载参数文件 -->
+  <rosparam command="load" file="$(find pillar_detect)/config/pillar_detect_params.yaml" />
+  
+  <!-- 可选：运行时覆盖参数 -->
+  <arg name="enable_accumulation" default="true" />
+  <param name="enable_accumulation" value="$(arg enable_accumulation)" />
+  
+  <arg name="rviz" default="true" />
+  <arg name="rviz_config" default="$(find pillar_detect)/rviz/pillar_detect.rviz" />
+  
+  <!-- 启动柱子检测节点 -->
+  <node name="pillar_detector" pkg="pillar_detect" type="pillar_detect" output="screen">
+    <!-- 可以在此添加额外的参数覆盖 -->
+    <!-- <param name="max_pillar_radius" value="0.4" /> -->
+  </node>
+  
+  <!-- 可选：启动rviz可视化 -->
+  <!-- <node if="$(arg rviz)" name="rviz" pkg="rviz" type="rviz" 
+        args="-d $(arg rviz_config)" required="false" /> -->
+</launch>

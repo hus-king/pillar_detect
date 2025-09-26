@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>pillar_detect</name>
+  <version>0.0.0</version>
+  <description>The pillar_detect package</description>
+
+  <maintainer email="hesiqi@todo.todo">hesiqi</maintainer>
+
+  <license>BSD</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <!-- ROS dependencies -->
+  <depend>roscpp</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>pcl_ros</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf</depend>
+
+  <!-- System dependencies (for PCL) -->
+  <depend>libpcl-all-dev</depend>
+
+  <!-- If you use PCL headers directly, this ensures linking -->
+  <!-- Note: pcl_ros already pulls in PCL, but explicit is safer -->
+
+  <export>
+  </export>
+</package>

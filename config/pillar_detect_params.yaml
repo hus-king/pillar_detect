@@ -1,0 +1,39 @@
+# 点云积累相关参数
+enable_accumulation: true       # 是否启用点云积累功能
+max_accumulated_clouds: 100   # 最大积累点云帧数
+accumulation_voxel_size: 0.05   # 积累点云降采样体素大小 (米)
+processing_timeout: 0.90        # 点云处理超时阈值（秒）
+
+# 柱子保留和自适应降采样参数
+enable_pillar_preservation: true    # 是否启用柱子保留优化
+enable_adaptive_sampling: true      # 是否启用自适应降采样
+enable_connect_broken_pillars: true # 是否启用断开柱子连接功能
+pillar_density_factor: 0.6          # 柱子密度因子 (值越大，添加的点越多)
+pillar_enhancement_points: 4        # 每个缺失层添加的点数
+fine_voxel_factor: 0.5              # 精细体素大小因子 (相对于标准体素大小)
+pillar_connection_xy_threshold: 0.2 # 连接断开柱子的XY平面距离阈值 (米)
+pillar_connection_max_z_gap: 0.8    # 连接断开柱子的最大Z方向间隙 (米)
+z_gap_fill_threshold: 0.9           # 大于此值的Z方向间隙将被填充点 (米)
+
+# 统计输出相关参数
+enable_point_count_output: true     # 是否启用点数统计输出
+detailed_stats_interval: 10         # 详细统计信息输出间隔 (每N次发布输出一次详细信息)
+
+# 点云预处理参数
+voxel_size: 0.05               # 初始降采样体素大小 (米)
+height_min: 0.1                # 高度过滤最小值 (米)
+height_max: 1.5                # 高度过滤最大值 (米)
+
+# 聚类参数
+cluster_tolerance: 0.2         # 聚类距离阈值 (米)
+min_cluster_size: 20           # 最小聚类点数
+max_cluster_size: 10000        # 最大聚类点数
+
+# 柱子检测参数
+min_pillar_height: 0.2         # 最小柱子高度 (米)
+max_pillar_radius: 0.08         # 最大柱子半径 (米)
+
+# 话题配置
+input_cloud_topic: "/cloud_registered"   # 输入点云话题
+pillar_cloud_topic: "/cloud_pillar"      # 输出柱子点云话题
+accumulated_cloud_topic: "/cloud_accumulated"  # 输出积累点云话题
